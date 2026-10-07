@@ -1,0 +1,21 @@
+# core
+torch>=2.1
+torchvision
+
+# detection
+ultralytics>=8.3
+
+# embeddings for the prototype bank
+transformers>=4.40
+
+# data / io
+pillow
+numpy
+pyyaml
+opencv-python
+pandas
+
+# plots for findings.md
+matplotlib
+seaborn
+scikit-learn
