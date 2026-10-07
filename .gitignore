@@ -1,3 +1,34 @@
+# data and model outputs 
+data/
+runs/
+weights/
+*.pt
+*.onnx
+*.engine
+
+# keep the dataset configs
+!data/*.yaml
+!data/.gitkeep
+
+# caches
+.cache/
+__pycache__/
+*.py[cod]
+.ipynb_checkpoints/
+
+# environments
+venv/
+.venv/
+env/
+
+# os / editor
+.DS_Store
+.vscode/
+.idea/
+
+# cluster job output
+slurm-*.out
+*.log
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[codz]
