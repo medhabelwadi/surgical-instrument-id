@@ -2,33 +2,29 @@
 """
 Surgical instrument identification demo.
 
-Two interactions on one synthetic tray of five instruments:
+Three ways to query one synthetic tray of five instruments:
 
-  1. Click an instrument  -> the classifier names it
-  2. Request a tool by name -> the system highlights every instance it finds,
-     or reports that the tool is not on this tray
+  1. Click an instrument      -> the classifier names it
+  2. Pick a tool from the list -> highlights every instance it finds
+  3. Say the tool out loud     -> Whisper transcribes, the name is resolved,
+                                  then the same search runs
 
-The "find by name" path runs the classifier over all five tiles and highlights
-by PREDICTION, not by ground truth -- otherwise the demo would be showing off
-the tray builder rather than the model. Ground truth is used only to mark
-whether each decision was right.
+The "find" path highlights by PREDICTION, not ground truth -- otherwise the
+demo would be showing off the tray builder rather than the model. Ground truth
+is used only to mark whether each decision was right.
 
-Tiles are drawn from the VALIDATION split only (the same 80/20 split by
-filename ID range that training used), so nothing on screen was trained on.
-Note this is a held-out split of the same capture session -- same drape, same
-lighting, same physical instruments -- not an independent test set.
+Tiles come from the VALIDATION split only (same 80/20 split by filename ID
+range that training used), so nothing on screen was trained on. It is a
+held-out split of the same capture session, not an independent test set.
 
-Tiling rather than compositing keeps each tile an unmodified training-
-distribution frame: cropping tightly around an instrument cost ~20 points of
-accuracy (docs/findings.md, experiment 4), so any reframing would handicap the
-model for reasons unrelated to the task being demonstrated.
-
-Works on Gradio 5 and 6 (theme/css moved to launch() in 6).
-
+    pip install gradio openai-whisper
     python demo_app.py --data /path/to/mendley-tools --weights classifier.pt
+    python demo_app.py ... --whisper-model small     # slower, more accurate
+    python demo_app.py ... --no-voice                # skip Whisper entirely
 """
 
 import argparse
+import difflib
 import random
 import re
 from pathlib import Path
@@ -48,10 +44,8 @@ IMAGENET_STD = [0.229, 0.224, 0.225]
 TILE = 640          # frame size the classifier was trained on
 N_TOOLS = 5
 
-# The dataset description lists nine categories but ships seven; gloves and
-# cotton were never uploaded, so the classifier cannot predict them. They are
-# offered here anyway -- asking for one is a legitimate way to exercise the
-# "not on this tray" path.
+# Listed in the dataset description but never published, so the classifier
+# cannot predict them. Offered anyway -- a clean way to exercise "not on tray".
 UNTRAINED_CLASSES = ["Surgical Gloves", "Medical Cotton"]
 
 GREEN = (60, 200, 90)
@@ -62,6 +56,55 @@ CSS = """
 #tray img { border-radius: 8px; }
 #readout { min-height: 170px; font-size: 1.02rem; }
 """
+
+# Spoken requests are not class names. "Hand me the mayos", "clamp",
+# "suture scissors" all have to resolve to a label the model knows.
+ALIASES = {
+    "Mayo": ["mayo", "mayos", "mayo scissors", "mayo scissor"],
+    "Stitch Scissors": ["stitch scissors", "stitch scissor", "suture scissors",
+                        "stitch", "suture scissor"],
+    "Episiotomy Scissors": ["episiotomy scissors", "episiotomy", "episiotomy scissor",
+                            "epis", "episiotomy shears"],
+    "Hemostat": ["hemostat", "hemostats", "haemostat", "clamp", "mosquito",
+                 "kelly", "artery forceps"],
+    "Forceps": ["forceps", "forcep", "tweezers", "pickups", "pick ups",
+                "tissue forceps"],
+    "Scalpel": ["scalpel", "blade", "knife", "scalpel blade", "ten blade"],
+    "Syringe": ["syringe", "needle", "injection"],
+    "Surgical Gloves": ["gloves", "glove", "surgical gloves"],
+    "Medical Cotton": ["cotton", "gauze", "swab", "medical cotton", "sponge"],
+}
+
+# Filler that surrounds the actual request.
+FILLER = re.compile(
+    r"\b(please|can i (have|get)|could i (have|get)|hand me|pass me|give me|"
+    r"i need|i want|get me|bring me|the|a|an|some|now|thanks|thank you)\b")
+
+
+def resolve_tool(text, valid):
+    """Map a spoken phrase to one of `valid`, or None.
+
+    Alias substring match first, then fuzzy match on the cleaned phrase.
+    Returns (label, how_it_matched) so the UI can be honest about guessing.
+    """
+    if not text:
+        return None, None
+    clean = FILLER.sub(" ", text.lower().strip(" .,!?"))
+    clean = re.sub(r"\s+", " ", clean).strip()
+
+    # longest alias first so "stitch scissors" beats "scissors"
+    pairs = [(label, a) for label, al in ALIASES.items() for a in al
+             if label in valid]
+    for label, alias in sorted(pairs, key=lambda p: -len(p[1])):
+        if alias in clean:
+            return label, f"matched “{alias}”"
+
+    candidates = [a for _, a in pairs]
+    close = difflib.get_close_matches(clean, candidates, n=1, cutoff=0.6)
+    if close:
+        label = next(l for l, a in pairs if a == close[0])
+        return label, f"closest match to “{close[0]}”"
+    return None, None
 
 
 class PartAwareNet(nn.Module):
@@ -130,7 +173,6 @@ class TrayBuilder:
 
     def build(self, n=N_TOOLS):
         rng = random.Random()
-        # sample with repetition so "find all instances" is a real query
         picks = [rng.choice(self.classes) for _ in range(n)]
         if len(set(picks)) < 3:                       # avoid a dull tray
             picks = rng.sample(self.classes, min(n, len(self.classes)))
@@ -169,19 +211,33 @@ def draw(rgb, tiles, highlight=None, click_xy=None):
     return vis
 
 
-def build_ui(clf: Classifier, trays: TrayBuilder):
+class Transcriber:
+    """Lazy Whisper wrapper -- the model loads on first use, not at startup."""
+
+    def __init__(self, name="base"):
+        self.name, self.model = name, None
+
+    def __call__(self, path):
+        if self.model is None:
+            import whisper
+            print(f"loading whisper '{self.name}' …")
+            self.model = whisper.load_model(self.name)
+        # fp16 is a GPU path; force it off so CPU runs cleanly
+        return self.model.transcribe(path, fp16=torch.cuda.is_available())["text"].strip()
+
+
+def build_ui(clf: Classifier, trays: TrayBuilder, asr: Transcriber | None):
     options = sorted(clf.classes + UNTRAINED_CLASSES)
 
     def new_tray():
         rgb, tiles = trays.build()
-        # classify every tile up front -- the "find" path reads these
         for t in tiles:
             ranked = clf.predict(rgb[:, t["x0"]:t["x1"]])
             t["pred"], t["conf"] = ranked[0]
             t["ranked"] = ranked
         st = {"rgb": rgb, "tiles": tiles}
         return rgb, st, ("New tray of five instruments. Click one, or request "
-                         "a tool by name.")
+                         "a tool by name or voice.")
 
     def on_click(st, evt: gr.SelectData):
         if not st:
@@ -195,50 +251,72 @@ def build_ui(clf: Classifier, trays: TrayBuilder):
         t = tiles[idx]
         ok = t["pred"] == t["truth"]
         vis = draw(rgb, tiles, {idx: (GREEN if ok else RED, t["pred"])}, (x, y))
-
         runners = "".join(f"\n- {n} — {p:.0%}" for n, p in t["ranked"][1:4])
         verdict = "correct" if ok else f"**incorrect** — actually *{t['truth']}*"
         return vis, (f"### {t['pred']}\n**{t['conf']:.0%} confidence** · {verdict}\n"
                      f"\nNext most likely:{runners}")
 
-    def on_find(st, wanted):
-        if not st:
-            return None, "Generate a tray first."
+    def search(st, wanted, prefix=""):
         tiles, rgb = st["tiles"], st["rgb"]
-
         found = [i for i, t in enumerate(tiles) if t["pred"] == wanted]
         actual = [i for i, t in enumerate(tiles) if t["truth"] == wanted]
 
         if not found:
-            vis = draw(rgb, tiles)
-            msg = f"### Not on this tray\nNo *{wanted}* detected."
+            msg = f"{prefix}### Not on this tray\nNo *{wanted}* detected."
             if wanted in UNTRAINED_CLASSES:
                 msg += ("\n\n_This class is listed in the dataset description "
-                        "but was never published, so the model cannot predict "
-                        "it._")
+                        "but was never published, so the model cannot predict it._")
             elif actual:
                 msg += (f"\n\n**Missed.** A *{wanted}* is present at position "
                         f"{', '.join(str(i + 1) for i in actual)} but was not "
                         f"recognised.")
-            return vis, msg
+            return draw(rgb, tiles), msg
 
         highlight = {i: (GREEN if tiles[i]["truth"] == wanted else RED,
                          f"{tiles[i]['conf']:.0%}") for i in found}
         vis = draw(rgb, tiles, highlight)
 
         n_right = sum(1 for i in found if tiles[i]["truth"] == wanted)
-        msg = [f"### Found {len(found)} × {wanted}",
+        msg = [f"{prefix}### Found {len(found)} × {wanted}",
                f"Position{'s' if len(found) > 1 else ''}: "
                f"{', '.join(str(i + 1) for i in found)}"]
         if n_right != len(found):
             n_fp = len(found) - n_right
-            msg.append(f"\n**{n_fp} false positive{'s' if n_fp > 1 else ''}** "
-                       f"(red).")
+            msg.append(f"\n**{n_fp} false positive{'s' if n_fp > 1 else ''}** (red).")
         missed = [i for i in actual if i not in found]
         if missed:
             msg.append(f"\n**Missed {len(missed)}** at position "
                        f"{', '.join(str(i + 1) for i in missed)}.")
         return vis, "\n".join(msg)
+
+    def on_find(st, wanted):
+        if not st:
+            return None, "Generate a tray first."
+        return search(st, wanted)
+
+    def on_voice(st, audio_path, current):
+        if not st:
+            return None, "Generate a tray first.", current
+        if asr is None:
+            return st["rgb"], "Voice input is disabled (`--no-voice`).", current
+        if not audio_path:
+            return st["rgb"], "No audio recorded.", current
+
+        try:
+            heard = asr(audio_path)
+        except Exception as exc:
+            return st["rgb"], f"Transcription failed: {exc}", current
+
+        wanted, how = resolve_tool(heard, options)
+        quoted = f'> heard: *“{heard}”*\n\n'
+        if wanted is None:
+            return (st["rgb"],
+                    quoted + "### Didn't catch a tool name\n"
+                    "Try naming one of the instruments in the list.",
+                    current)
+
+        vis, msg = search(st, wanted, prefix=quoted)
+        return vis, msg + f"\n\n<sub>{how}</sub>", wanted
 
     with gr.Blocks(title="Surgical Instrument ID") as ui:
         state = gr.State(None)
@@ -250,6 +328,10 @@ def build_ui(clf: Classifier, trays: TrayBuilder):
                                scale=3)
             find = gr.Button("Find on tray", variant="primary", scale=1)
             regen = gr.Button("New tray", scale=1)
+
+        if asr is not None:
+            mic = gr.Audio(sources=["microphone"], type="filepath",
+                           label="…or say it out loud (e.g. “hand me the mayo scissors”)")
 
         img = gr.Image(type="numpy", interactive=False, elem_id="tray",
                        show_label=False)
@@ -264,6 +346,8 @@ def build_ui(clf: Classifier, trays: TrayBuilder):
         regen.click(new_tray, None, [img, state, out])
         find.click(on_find, [state, tool], [img, out])
         img.select(on_click, [state], [img, out])
+        if asr is not None:
+            mic.stop_recording(on_voice, [state, mic, tool], [img, out, tool])
         ui.load(new_tray, None, [img, state, out])
 
     return ui
@@ -273,11 +357,15 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--data", required=True, type=Path)
     ap.add_argument("--weights", default="classifier.pt")
+    ap.add_argument("--whisper-model", default="base",
+                    help="tiny | base | small | medium")
+    ap.add_argument("--no-voice", action="store_true")
     ap.add_argument("--port", type=int, default=7860)
     ap.add_argument("--share", action="store_true")
     args = ap.parse_args()
 
-    ui = build_ui(Classifier(args.weights), TrayBuilder(args.data))
+    asr = None if args.no_voice else Transcriber(args.whisper_model)
+    ui = build_ui(Classifier(args.weights), TrayBuilder(args.data), asr)
 
     # theme and css live on Blocks() in gradio 5 and on launch() in 6
     kwargs = dict(server_name="0.0.0.0", server_port=args.port, share=args.share)
