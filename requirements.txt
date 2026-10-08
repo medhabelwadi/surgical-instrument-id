@@ -19,3 +19,6 @@ pandas
 matplotlib
 seaborn
 scikit-learn
+
+# interactive demo
+gradio>=4.44

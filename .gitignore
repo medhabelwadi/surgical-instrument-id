@@ -5,6 +5,7 @@ weights/
 *.pt
 *.onnx
 *.engine
+!/artifacts/classifier.pt
 
 # keep the dataset configs
 !data/*.yaml
