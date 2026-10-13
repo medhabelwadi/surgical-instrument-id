@@ -6,6 +6,7 @@ weights/
 *.onnx
 *.engine
 !/artifacts/classifier.pt
+!/artifacts/classifier_new.pt
 
 # keep the dataset configs
 !data/*.yaml
@@ -250,3 +251,4 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+*.mp4
